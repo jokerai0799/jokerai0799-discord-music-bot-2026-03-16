@@ -27,6 +27,7 @@ const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
 });
 
 const queues = new Map();
+const IDLE_DISCONNECT_MS = 60_000;
 
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
@@ -36,6 +37,7 @@ function getQueue(guildId) {
       current: null,
       textChannel: null,
       voiceChannelId: null,
+      idleTimer: null,
     });
   }
 
@@ -175,9 +177,33 @@ async function sendNowPlaying(queue, song) {
   });
 }
 
+function clearIdleTimer(queue) {
+  if (!queue?.idleTimer) return;
+  clearTimeout(queue.idleTimer);
+  queue.idleTimer = null;
+}
+
+async function scheduleIdleDisconnect(guildId) {
+  const queue = queues.get(guildId);
+  if (!queue?.player) return;
+
+  clearIdleTimer(queue);
+  queue.idleTimer = setTimeout(async () => {
+    const latestQueue = queues.get(guildId);
+    if (!latestQueue?.player || latestQueue.current || latestQueue.songs.length) {
+      return;
+    }
+
+    await safeChannelSend(latestQueue.textChannel, '👋 Leaving voice channel after 60 seconds of inactivity.');
+    destroyQueue(guildId);
+  }, IDLE_DISCONNECT_MS);
+}
+
 function destroyQueue(guildId) {
   const queue = queues.get(guildId);
   if (!queue) return;
+
+  clearIdleTimer(queue);
 
   try {
     queue.player?.disconnect();
@@ -194,11 +220,11 @@ async function playNext(guildId) {
   if (!next) {
     queue.current = null;
     await queue.player.stopTrack();
-    await queue.player.disconnect();
-    queues.delete(guildId);
+    await scheduleIdleDisconnect(guildId);
     return;
   }
 
+  clearIdleTimer(queue);
   queue.current = next;
   await queue.player.playTrack({ track: { encoded: next.encoded } });
   await sendNowPlaying(queue, next);
@@ -281,6 +307,7 @@ client.on('interactionCreate', async (interaction) => {
       const song = await resolveTrack(interaction.options.getString('query', true));
       await ensurePlayer(guild, voiceChannel, interaction.channel);
 
+      clearIdleTimer(queue);
       queue.songs.push(song);
       const shouldStart = !queue.current;
 
