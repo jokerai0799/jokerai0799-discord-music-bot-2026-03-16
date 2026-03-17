@@ -305,7 +305,7 @@ async function playNext(guildId) {
 
   try {
     await queue.player.playTrack({ track: { encoded: next.encoded } });
-    await queue.player.setVolume(queue.volume);
+    await queue.player.setGlobalVolume(queue.volume);
     await sendNowPlaying(queue, next);
   } catch (error) {
     console.error('Failed to start next track:', error);
