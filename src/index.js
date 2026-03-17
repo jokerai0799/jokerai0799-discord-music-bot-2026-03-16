@@ -275,6 +275,10 @@ async function destroyQueue(guildId) {
   if (!queue) return;
 
   clearIdleTimer(queue);
+  queue.current = null;
+  queue.songs = [];
+  queue.player = null;
+  queue.voiceChannelId = null;
 
   try {
     await shoukaku.leaveVoiceChannel(guildId);
