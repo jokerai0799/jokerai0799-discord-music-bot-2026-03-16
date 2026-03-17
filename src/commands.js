@@ -3,9 +3,9 @@ import { SlashCommandBuilder } from 'discord.js';
 export const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a song from YouTube (URL or search query)')
+    .setDescription('Play a song from SoundCloud (URL or search query)')
     .addStringOption(opt =>
-      opt.setName('query').setDescription('YouTube URL or search term').setRequired(true)
+      opt.setName('query').setDescription('SoundCloud URL or search term').setRequired(true)
     ),
 
   new SlashCommandBuilder()

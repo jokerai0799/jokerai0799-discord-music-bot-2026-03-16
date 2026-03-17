@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } from 'discord.js';
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -19,6 +19,7 @@ const client = new Client({
 });
 
 const queues = new Map();
+let soundCloudReady = false;
 
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
@@ -33,6 +34,8 @@ function getQueue(guildId) {
       current: null,
       textChannel: null,
       playing: false,
+      playerEventsBound: false,
+      connectionEventsBound: false,
     });
   }
 
@@ -47,6 +50,9 @@ function cleanupQueue(queue) {
   try {
     queue.connection?.destroy();
   } catch {}
+
+  queue.connection = null;
+  queue.connectionEventsBound = false;
 }
 
 function destroyQueue(guildId) {
@@ -61,10 +67,62 @@ function formatSong(song) {
   return `**${song.title}** (${song.duration})`;
 }
 
-async function sendNowPlaying(queue, song) {
-  if (!queue.textChannel) return;
+async function ensureSoundCloud() {
+  if (soundCloudReady) return;
 
-  await queue.textChannel.send({
+  const clientId = await playDl.getFreeClientID();
+  await playDl.setToken({ soundcloud: { client_id: clientId } });
+  soundCloudReady = true;
+  console.log('SoundCloud client initialized.');
+}
+
+async function safeChannelSend(channel, payload) {
+  if (!channel) return;
+
+  try {
+    await channel.send(payload);
+  } catch (error) {
+    console.error('Failed to send channel message:', error);
+  }
+}
+
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(payload);
+    }
+
+    return await interaction.reply(payload);
+  } catch (error) {
+    if (error?.code === 10062) {
+      console.warn('Interaction expired before reply could be sent.');
+      return null;
+    }
+
+    console.error('Interaction reply failed:', error);
+    return null;
+  }
+}
+
+async function safeDefer(interaction) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply();
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === 10062) {
+      console.warn('Interaction expired before deferReply could be sent.');
+      return false;
+    }
+
+    console.error('deferReply failed:', error);
+    return false;
+  }
+}
+
+async function sendNowPlaying(queue, song) {
+  await safeChannelSend(queue.textChannel, {
     embeds: [
       new EmbedBuilder()
         .setColor(0x5865f2)
@@ -73,6 +131,24 @@ async function sendNowPlaying(queue, song) {
         .setURL(song.url),
     ],
   });
+}
+
+function bindPlayerEvents(queue, guildId) {
+  if (queue.playerEventsBound) return;
+
+  queue.player.on(AudioPlayerStatus.Idle, () => {
+    playNext(guildId).catch((error) => {
+      console.error('Failed to continue queue:', error);
+    });
+  });
+
+  queue.player.on('error', async (error) => {
+    console.error('Player error:', error);
+    await safeChannelSend(queue.textChannel, '⚠️ Player error occurred. Trying the next track.');
+    await playNext(guildId);
+  });
+
+  queue.playerEventsBound = true;
 }
 
 async function playNext(guildId) {
@@ -98,32 +174,35 @@ async function playNext(guildId) {
     await sendNowPlaying(queue, song);
   } catch (error) {
     console.error('Playback error:', error);
-    if (queue.textChannel) {
-      await queue.textChannel.send(`⚠️ Error playing ${formatSong(song)}. Skipping to the next track.`);
-    }
+    await safeChannelSend(queue.textChannel, `⚠️ Error playing ${formatSong(song)}. Skipping to the next track.`);
     await playNext(guildId);
   }
 }
 
 async function resolveSong(query) {
-  if (playDl.yt_validate(query) === 'video') {
-    const details = await playDl.video_basic_info(query);
+  await ensureSoundCloud();
+
+  const soundcloudValidation = playDl.so_validate(query);
+  if (soundcloudValidation === 'track') {
+    const details = await playDl.soundcloud(query);
     return {
-      url: query,
-      title: details.video_details.title,
-      duration: details.video_details.durationRaw || 'Live',
+      url: details.url,
+      title: details.name,
+      duration: details.durationRaw || 'Unknown',
+      source: 'soundcloud',
     };
   }
 
-  const results = await playDl.search(query, { limit: 1 });
-  if (!results.length) {
-    throw new Error('No results found.');
+  const soundcloudResults = await playDl.search(query, { limit: 1, source: { soundcloud: 'tracks' } });
+  if (!soundcloudResults.length) {
+    throw new Error('No SoundCloud results found for that query.');
   }
 
   return {
-    url: results[0].url,
-    title: results[0].title,
-    duration: results[0].durationRaw || 'Unknown',
+    url: soundcloudResults[0].url,
+    title: soundcloudResults[0].name || soundcloudResults[0].title,
+    duration: soundcloudResults[0].durationRaw || 'Unknown',
+    source: 'soundcloud',
   };
 }
 
@@ -131,6 +210,11 @@ function ensureVoiceAccess(interaction) {
   const voiceChannel = interaction.member?.voice?.channel;
   if (!voiceChannel) {
     return { error: '❌ Join a voice channel first.' };
+  }
+
+  const permissions = voiceChannel.permissionsFor(interaction.guild.members.me);
+  if (!permissions?.has(['Connect', 'Speak'])) {
+    return { error: '❌ I need Connect and Speak permissions in that voice channel.' };
   }
 
   const botChannelId = interaction.guild?.members?.me?.voice?.channelId;
@@ -141,30 +225,11 @@ function ensureVoiceAccess(interaction) {
   return { voiceChannel };
 }
 
-async function connectQueue(queue, guild, voiceChannel) {
-  if (queue.connection) {
-    return queue.connection;
-  }
+function bindConnectionEvents(queue, guildId) {
+  if (!queue.connection || queue.connectionEventsBound) return;
 
-  queue.connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: true,
-  });
-
-  queue.player.on(AudioPlayerStatus.Idle, () => {
-    playNext(guild.id).catch((error) => {
-      console.error('Failed to continue queue:', error);
-    });
-  });
-
-  queue.player.on('error', async (error) => {
-    console.error('Player error:', error);
-    if (queue.textChannel) {
-      await queue.textChannel.send('⚠️ Player error occurred. Trying the next track.');
-    }
-    await playNext(guild.id);
+  queue.connection.on('stateChange', (oldState, newState) => {
+    console.log(`Voice state [${guildId}]: ${oldState.status} -> ${newState.status}`);
   });
 
   queue.connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -174,17 +239,47 @@ async function connectQueue(queue, guild, voiceChannel) {
         entersState(queue.connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
-      destroyQueue(guild.id);
+      destroyQueue(guildId);
     }
   });
 
+  queue.connectionEventsBound = true;
+}
+
+async function connectQueue(queue, guild, voiceChannel) {
+  bindPlayerEvents(queue, guild.id);
+
+  if (!queue.connection) {
+    queue.connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: true,
+    });
+    queue.connectionEventsBound = false;
+  }
+
+  bindConnectionEvents(queue, guild.id);
   queue.connection.subscribe(queue.player);
-  await entersState(queue.connection, VoiceConnectionStatus.Ready, 15_000);
+
+  try {
+    await entersState(queue.connection, VoiceConnectionStatus.Ready, 15_000);
+  } catch (error) {
+    cleanupQueue(queue);
+    throw new Error('Voice connection timed out. Check the bot voice permissions and VPS outbound UDP/network access.');
+  }
+
   return queue.connection;
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag} (${config.nodeEnv})`);
+
+  try {
+    await ensureSoundCloud();
+  } catch (error) {
+    console.error('Failed to initialize SoundCloud client:', error);
+  }
   if (!client.application) return;
 
   try {
@@ -206,11 +301,13 @@ client.on('interactionCreate', async (interaction) => {
   if (commandName === 'play') {
     const { voiceChannel, error } = ensureVoiceAccess(interaction);
     if (error) {
-      return interaction.reply({ content: error, ephemeral: true });
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
     }
 
+    const deferred = await safeDefer(interaction);
+    if (!deferred) return;
+
     const query = interaction.options.getString('query', true);
-    await interaction.deferReply();
 
     try {
       const song = await resolveSong(query);
@@ -222,73 +319,73 @@ client.on('interactionCreate', async (interaction) => {
       await connectQueue(queue, guild, voiceChannel);
 
       if (shouldStartPlayback) {
-        await interaction.editReply(`✅ Added to queue: ${formatSong(song)}`);
+        await safeReply(interaction, `✅ Added to queue: ${formatSong(song)}`);
         await playNext(guild.id);
         return;
       }
 
-      return interaction.editReply(`✅ Added to queue (#${queue.songs.length}): ${formatSong(song)}`);
+      return safeReply(interaction, `✅ Added to queue (#${queue.songs.length}): ${formatSong(song)}`);
     } catch (error) {
       console.error('Play error:', error);
       if (queue.songs.length && !queue.current) {
         queue.songs = [];
       }
-      return interaction.editReply(`⚠️ ${error.message}`);
+      return safeReply(interaction, `⚠️ ${error.message || 'Unable to start playback.'}`);
     }
   }
 
   if (commandName === 'skip') {
     if (!queue.current) {
-      return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+      return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
     queue.player.stop();
-    return interaction.reply('⏭️ Skipped.');
+    return safeReply(interaction, '⏭️ Skipped.');
   }
 
   if (commandName === 'pause') {
     if (!queue.current || !queue.playing) {
-      return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+      return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
     queue.player.pause();
     queue.playing = false;
-    return interaction.reply('⏸️ Paused.');
+    return safeReply(interaction, '⏸️ Paused.');
   }
 
   if (commandName === 'resume') {
     if (!queue.current) {
-      return interaction.reply({ content: 'Nothing is queued right now.', ephemeral: true });
+      return safeReply(interaction, { content: 'Nothing is queued right now.', flags: MessageFlags.Ephemeral });
     }
 
     if (queue.playing) {
-      return interaction.reply({ content: 'Already playing.', ephemeral: true });
+      return safeReply(interaction, { content: 'Already playing.', flags: MessageFlags.Ephemeral });
     }
 
     queue.player.unpause();
     queue.playing = true;
-    return interaction.reply('▶️ Resumed.');
+    return safeReply(interaction, '▶️ Resumed.');
   }
 
   if (commandName === 'stop') {
     if (!queue.current && !queue.songs.length) {
-      return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+      return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
     destroyQueue(guild.id);
-    return interaction.reply('⏹️ Stopped and cleared the queue.');
+    return safeReply(interaction, '⏹️ Stopped and cleared the queue.');
   }
 
   if (commandName === 'queue') {
     if (!queue.current && !queue.songs.length) {
-      return interaction.reply({ content: 'Queue is empty.', ephemeral: true });
+      return safeReply(interaction, { content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
     }
 
     const lines = [];
     if (queue.current) lines.push(`▶️ ${formatSong(queue.current)}`);
     queue.songs.forEach((song, index) => lines.push(`${index + 1}. ${formatSong(song)}`));
 
-    return interaction.reply({
+    return safeReply(interaction, {
       embeds: [
         new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Queue').setDescription(lines.join('\n')),
       ],
@@ -297,10 +394,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (commandName === 'nowplaying') {
     if (!queue.current) {
-      return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
+      return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
-    return interaction.reply({
+    return safeReply(interaction, {
       embeds: [
         new EmbedBuilder()
           .setColor(0x5865f2)
@@ -310,6 +407,14 @@ client.on('interactionCreate', async (interaction) => {
       ],
     });
   }
+});
+
+client.on('error', (error) => {
+  console.error('Discord client error:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error);
 });
 
 async function shutdown(signal) {
