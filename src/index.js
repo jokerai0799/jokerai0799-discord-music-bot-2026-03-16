@@ -186,14 +186,6 @@ async function registerCommands() {
   if (!client.application || !config.discordClientId) return;
 
   const body = commands.map((command) => command.toJSON());
-
-  if (config.discordGuildId) {
-    await rest.put(Routes.applicationGuildCommands(config.discordClientId, config.discordGuildId), { body });
-    await rest.put(Routes.applicationCommands(config.discordClientId), { body: [] });
-    console.log(`Registered ${body.length} guild slash commands and cleared global command drift.`);
-    return;
-  }
-
   await rest.put(Routes.applicationCommands(config.discordClientId), { body });
   console.log(`Registered ${body.length} global slash commands.`);
 }
