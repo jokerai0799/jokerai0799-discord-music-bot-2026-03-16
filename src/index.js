@@ -27,23 +27,45 @@ const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
 });
 
 const rest = new REST({ version: '10' }).setToken(config.discordBotToken);
-
 const queues = new Map();
 const IDLE_DISCONNECT_MS = 60_000;
 
+const LOOP_MODES = {
+  OFF: 'off',
+  TRACK: 'track',
+  QUEUE: 'queue',
+};
+
+function bootstrapQueue(guildId) {
+  const isPremium = config.premiumGuildIds.includes(guildId);
+  return {
+    player: null,
+    songs: [],
+    current: null,
+    textChannel: null,
+    voiceChannelId: null,
+    idleTimer: null,
+    loop: LOOP_MODES.OFF,
+    volume: Math.min(config.defaultVolume, isPremium ? config.volumeMaxPremium : config.volumeMaxFree),
+    isPremium,
+    maxSize: isPremium ? config.queueLimitPremium : config.queueLimitFree,
+    volumeMax: isPremium ? config.volumeMaxPremium : config.volumeMaxFree,
+  };
+}
+
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
-    queues.set(guildId, {
-      player: null,
-      songs: [],
-      current: null,
-      textChannel: null,
-      voiceChannelId: null,
-      idleTimer: null,
-    });
+    queues.set(guildId, bootstrapQueue(guildId));
   }
 
-  return queues.get(guildId);
+  const queue = queues.get(guildId);
+  const isPremium = config.premiumGuildIds.includes(guildId);
+  queue.isPremium = isPremium;
+  queue.maxSize = isPremium ? config.queueLimitPremium : config.queueLimitFree;
+  queue.volumeMax = isPremium ? config.volumeMaxPremium : config.volumeMaxFree;
+  queue.volume = Math.min(queue.volume, queue.volumeMax);
+
+  return queue;
 }
 
 function formatSong(song) {
@@ -60,7 +82,9 @@ function formatDuration(ms) {
   const seconds = totalSeconds % 60;
 
   if (hours > 0) {
-    return [hours, minutes, seconds].map((part, index) => String(part).padStart(index === 0 ? 1 : 2, '0')).join(':');
+    return [hours, minutes, seconds]
+      .map((part, index) => String(part).padStart(index === 0 ? 1 : 2, '0'))
+      .join(':');
   }
 
   return [minutes, seconds].map((part) => String(part).padStart(2, '0')).join(':');
@@ -130,6 +154,34 @@ function ensureVoiceAccess(interaction) {
   return { voiceChannel };
 }
 
+function ensureControlAccess(interaction, queue) {
+  if (!queue?.player) {
+    return { error: 'I am not connected to a voice channel right now.' };
+  }
+
+  const memberChannel = interaction.member?.voice?.channel;
+  if (!memberChannel) {
+    return { error: 'Join a voice channel to use that command.' };
+  }
+
+  const botChannelId = interaction.guild?.members?.me?.voice?.channelId;
+  if (!botChannelId) {
+    return { error: 'I am not connected to voice right now.' };
+  }
+
+  if (memberChannel.id !== botChannelId) {
+    return { error: 'Join the same voice channel as the bot to use that command.' };
+  }
+
+  return { voiceChannel: memberChannel };
+}
+
+function formatLoopLabel(loopMode) {
+  if (loopMode === LOOP_MODES.TRACK) return 'Track';
+  if (loopMode === LOOP_MODES.QUEUE) return 'Queue';
+  return 'Off';
+}
+
 async function registerCommands() {
   if (!client.application || !config.discordClientId) return;
 
@@ -189,7 +241,8 @@ async function sendNowPlaying(queue, song) {
         .setURL(song.url || null)
         .addFields(
           { name: 'Artist', value: song.author || 'Unknown', inline: true },
-          { name: 'Source', value: 'SoundCloud via Lavalink', inline: true },
+          { name: 'Loop', value: formatLoopLabel(queue.loop), inline: true },
+          { name: 'Volume', value: `${queue.volume}%`, inline: true },
         ),
     ],
   });
@@ -239,15 +292,43 @@ async function playNext(guildId) {
   const next = queue.songs.shift();
   if (!next) {
     queue.current = null;
-    await queue.player.stopTrack();
     await scheduleIdleDisconnect(guildId);
     return;
   }
 
   clearIdleTimer(queue);
   queue.current = next;
-  await queue.player.playTrack({ track: { encoded: next.encoded } });
-  await sendNowPlaying(queue, next);
+
+  try {
+    await queue.player.playTrack({ track: { encoded: next.encoded } });
+    await queue.player.setVolume(queue.volume);
+    await sendNowPlaying(queue, next);
+  } catch (error) {
+    console.error('Failed to start next track:', error);
+    queue.current = null;
+    if (queue.songs.length) {
+      await playNext(guildId);
+    } else {
+      await scheduleIdleDisconnect(guildId);
+    }
+  }
+}
+
+async function handleTrackFinished(guildId, reason = 'finished') {
+  const queue = queues.get(guildId);
+  if (!queue) return;
+
+  const finished = queue.current;
+  queue.current = null;
+  const finishedNaturally = reason === 'finished';
+
+  if (finishedNaturally && queue.loop === LOOP_MODES.TRACK && finished) {
+    queue.songs.unshift(finished);
+  } else if (finishedNaturally && queue.loop === LOOP_MODES.QUEUE && finished) {
+    queue.songs.push(finished);
+  }
+
+  await playNext(guildId);
 }
 
 async function ensurePlayer(guild, voiceChannel, textChannel) {
@@ -266,13 +347,17 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
   const player = await shoukaku.joinVoiceChannel({
     guildId: guild.id,
     channelId: voiceChannel.id,
-    shardId: 0,
+    shardId: guild.shardId ?? 0,
     deaf: true,
     mute: false,
   });
 
-  player.on('end', () => {
-    playNext(guild.id).catch((error) => {
+  player.on('end', (event) => {
+    if (event?.reason === 'replaced' || event?.reason === 'cleanup') {
+      return;
+    }
+
+    handleTrackFinished(guild.id, event?.reason).catch((error) => {
       console.error('Failed to continue queue:', error);
     });
   });
@@ -287,14 +372,15 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
 
   player.on('stuck', (error) => {
     console.error('Lavalink player stuck:', error);
-    playNext(guild.id).catch(console.error);
+    handleTrackFinished(guild.id, 'stuck').catch(console.error);
   });
 
   queue.player = player;
+  await queue.player.setVolume(queue.volume);
   return queue;
 }
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag} (${config.nodeEnv})`);
 
   try {
@@ -321,6 +407,16 @@ client.on('interactionCreate', async (interaction) => {
     const deferred = await safeDefer(interaction);
     if (!deferred) return;
 
+    if (queue.songs.length >= queue.maxSize) {
+      const note = queue.isPremium
+        ? ''
+        : '\nPremium tiers (on the roadmap) will raise this limit once available.';
+      return safeReply(
+        interaction,
+        `⚠️ Queue limit reached (${queue.maxSize} upcoming tracks). Remove something before adding more.${note}`,
+      );
+    }
+
     try {
       const song = await resolveTrack(interaction.options.getString('query', true));
       await ensurePlayer(guild, voiceChannel, interaction.channel);
@@ -343,6 +439,11 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (commandName === 'skip') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
     if (!queue.current || !queue.player) {
       return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
@@ -352,6 +453,11 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (commandName === 'pause') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
     if (!queue.current || !queue.player) {
       return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
@@ -361,6 +467,11 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (commandName === 'resume') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
     if (!queue.current || !queue.player) {
       return safeReply(interaction, { content: 'Nothing is queued right now.', flags: MessageFlags.Ephemeral });
     }
@@ -370,12 +481,18 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (commandName === 'stop') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
     if (!queue.current && !queue.songs.length) {
       return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
     queue.songs = [];
     queue.current = null;
+    queue.loop = LOOP_MODES.OFF;
     clearIdleTimer(queue);
     try {
       await queue.player?.stopTrack();
@@ -389,15 +506,28 @@ client.on('interactionCreate', async (interaction) => {
       return safeReply(interaction, { content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
     }
 
-    const lines = [];
-    if (queue.current) lines.push(`▶️ ${formatSong(queue.current)}`);
-    queue.songs.forEach((song, index) => lines.push(`${index + 1}. ${formatSong(song)}`));
+    const description = [];
+    if (queue.current) {
+      description.push(`▶️ ${formatSong(queue.current)}`);
+    }
 
-    return safeReply(interaction, {
-      embeds: [
-        new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Queue').setDescription(lines.join('\n')),
-      ],
-    });
+    if (queue.songs.length) {
+      queue.songs.forEach((song, index) => {
+        description.push(`${index + 1}. ${formatSong(song)}`);
+      });
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('📋 Queue')
+      .setDescription(description.join('\n'))
+      .setFooter({
+        text: `Loop: ${formatLoopLabel(queue.loop)} • Volume: ${queue.volume}% • ${
+          queue.isPremium ? 'Premium' : 'Standard'
+        } guild limit: ${queue.maxSize}`,
+      });
+
+    return safeReply(interaction, { embeds: [embed] });
   }
 
   if (commandName === 'nowplaying') {
@@ -411,9 +541,138 @@ client.on('interactionCreate', async (interaction) => {
           .setColor(0x5865f2)
           .setTitle('🎵 Now Playing')
           .setDescription(formatSong(queue.current))
-          .setURL(queue.current.url || null),
+          .setURL(queue.current.url || null)
+          .addFields(
+            { name: 'Artist', value: queue.current.author || 'Unknown', inline: true },
+            { name: 'Loop', value: formatLoopLabel(queue.loop), inline: true },
+            { name: 'Volume', value: `${queue.volume}%`, inline: true },
+          ),
       ],
     });
+  }
+
+  if (commandName === 'remove') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
+    if (!queue.songs.length) {
+      return safeReply(interaction, { content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
+    }
+
+    const position = interaction.options.getInteger('position', true);
+    if (position < 1 || position > queue.songs.length) {
+      return safeReply(
+        interaction,
+        { content: `Position must be between 1 and ${queue.songs.length}.`, flags: MessageFlags.Ephemeral },
+      );
+    }
+
+    const [removed] = queue.songs.splice(position - 1, 1);
+    return safeReply(interaction, `🗑️ Removed: ${formatSong(removed)}`);
+  }
+
+  if (commandName === 'shuffle') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
+    if (queue.songs.length < 2) {
+      return safeReply(interaction, { content: 'Need at least 2 songs queued to shuffle.', flags: MessageFlags.Ephemeral });
+    }
+
+    for (let i = queue.songs.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [queue.songs[i], queue.songs[j]] = [queue.songs[j], queue.songs[i]];
+    }
+
+    return safeReply(interaction, '🔀 Shuffled the upcoming songs.');
+  }
+
+  if (commandName === 'loop') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
+    if (!queue.player) {
+      return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+    }
+
+    const mode = interaction.options.getString('mode', true);
+    if (!Object.values(LOOP_MODES).includes(mode)) {
+      return safeReply(interaction, { content: 'Invalid loop mode.', flags: MessageFlags.Ephemeral });
+    }
+
+    queue.loop = mode;
+    return safeReply(interaction, `🔁 Loop mode set to **${formatLoopLabel(mode)}**.`);
+  }
+
+  if (commandName === 'volume') {
+    const { error } = ensureControlAccess(interaction, queue);
+    if (error) {
+      return safeReply(interaction, { content: error, flags: MessageFlags.Ephemeral });
+    }
+
+    const requested = interaction.options.getInteger('level', true);
+    const max = queue.volumeMax;
+    if (requested < 1 || requested > max) {
+      return safeReply(
+        interaction,
+        {
+          content: `Volume must be between 1 and ${max}%.${
+            queue.isPremium ? '' : ' Higher ceilings unlock once premium tiers launch.'
+          }`,
+          flags: MessageFlags.Ephemeral,
+        },
+      );
+    }
+
+    queue.volume = requested;
+    try {
+      await queue.player?.setVolume(requested);
+    } catch (error) {
+      console.error('Failed to set volume:', error);
+      return safeReply(interaction, '⚠️ Volume set internally, but Lavalink did not accept the change.');
+    }
+
+    return safeReply(interaction, `🔊 Volume set to ${requested}%.`);
+  }
+
+  if (commandName === 'premium') {
+    const currentTier = queue.isPremium ? 'Premium' : 'Standard';
+    const liveBenefits = [
+      `• Queue limit: up to ${queue.maxSize} songs`,
+      `• Volume ceiling: ${queue.volumeMax}%`,
+    ];
+
+    const planned = [
+      '• Saved playlists per guild',
+      '• Multi-source playback (YouTube + Spotify linking)',
+      '• Optional 24/7 channel idle mode',
+    ];
+
+    const embed = new EmbedBuilder()
+      .setColor(queue.isPremium ? 0xfbbf24 : 0x5865f2)
+      .setTitle('Jukebox Premium Status')
+      .setDescription(
+        queue.isPremium
+          ? 'This guild is flagged as Premium in the bot configuration.'
+          : 'This guild is currently using the standard feature set.',
+      )
+      .addFields(
+        { name: 'Current tier', value: currentTier, inline: true },
+        { name: 'Working benefits', value: liveBenefits.join('\n') || 'Standard limits', inline: false },
+        {
+          name: 'Roadmap (not yet live)',
+          value: planned.join('\n'),
+          inline: false,
+        },
+      );
+
+    return safeReply(interaction, { embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 });
 
