@@ -213,19 +213,21 @@ async function scheduleIdleDisconnect(guildId) {
     }
 
     await safeChannelSend(latestQueue.textChannel, '👋 Leaving voice channel after 60 seconds of inactivity.');
-    destroyQueue(guildId);
+    await destroyQueue(guildId);
   }, IDLE_DISCONNECT_MS);
 }
 
-function destroyQueue(guildId) {
+async function destroyQueue(guildId) {
   const queue = queues.get(guildId);
   if (!queue) return;
 
   clearIdleTimer(queue);
 
   try {
-    queue.player?.disconnect();
-  } catch {}
+    await shoukaku.leaveVoiceChannel(guildId);
+  } catch (error) {
+    console.error('Failed to leave voice channel cleanly:', error);
+  }
 
   queues.delete(guildId);
 }
@@ -276,7 +278,7 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
   });
 
   player.on('closed', () => {
-    destroyQueue(guild.id);
+    destroyQueue(guild.id).catch(console.error);
   });
 
   player.on('exception', (error) => {
@@ -378,7 +380,7 @@ client.on('interactionCreate', async (interaction) => {
     try {
       await queue.player?.stopTrack();
     } catch {}
-    destroyQueue(guild.id);
+    await destroyQueue(guild.id);
     return safeReply(interaction, '⏹️ Stopped and cleared the queue.');
   }
 
@@ -434,7 +436,7 @@ process.on('unhandledRejection', (error) => {
 async function shutdown(signal) {
   console.log(`Received ${signal}. Shutting down gracefully...`);
   for (const guildId of queues.keys()) {
-    destroyQueue(guildId);
+    await destroyQueue(guildId);
   }
 
   await client.destroy();
