@@ -9,14 +9,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-const nodes = {
-  [config.lavalinkName]: {
+const nodes = [
+  {
     name: config.lavalinkName,
     url: `${config.lavalinkHost}:${config.lavalinkPort}`,
     auth: config.lavalinkPassword,
     secure: config.lavalinkSecure,
   },
-};
+];
 
 const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
   moveOnDisconnect: false,
