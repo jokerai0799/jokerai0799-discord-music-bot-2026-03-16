@@ -213,12 +213,11 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
     return queue;
   }
 
-  const node = shoukaku.getIdealNode();
-  if (!node) {
+  if (!shoukaku.getIdealNode()) {
     throw new Error('No Lavalink node is connected.');
   }
 
-  const player = await node.joinChannel({
+  const player = await shoukaku.joinVoiceChannel({
     guildId: guild.id,
     channelId: voiceChannel.id,
     shardId: 0,
