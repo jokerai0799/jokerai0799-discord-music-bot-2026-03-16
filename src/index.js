@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, MessageFlags, Routes, REST } from 'discord.js';
 import { Connectors, Shoukaku } from 'shoukaku';
 import { commands } from './commands.js';
 import { getConfig } from './config.js';
@@ -25,6 +25,8 @@ const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
   reconnectInterval: 5_000,
   restTimeout: 15_000,
 });
+
+const rest = new REST({ version: '10' }).setToken(config.discordBotToken);
 
 const queues = new Map();
 const IDLE_DISCONNECT_MS = 60_000;
@@ -126,6 +128,22 @@ function ensureVoiceAccess(interaction) {
   }
 
   return { voiceChannel };
+}
+
+async function registerCommands() {
+  if (!client.application || !config.discordClientId) return;
+
+  const body = commands.map((command) => command.toJSON());
+
+  if (config.discordGuildId) {
+    await rest.put(Routes.applicationGuildCommands(config.discordClientId, config.discordGuildId), { body });
+    await rest.put(Routes.applicationCommands(config.discordClientId), { body: [] });
+    console.log(`Registered ${body.length} guild slash commands and cleared global command drift.`);
+    return;
+  }
+
+  await rest.put(Routes.applicationCommands(config.discordClientId), { body });
+  console.log(`Registered ${body.length} global slash commands.`);
 }
 
 async function resolveTrack(query) {
@@ -276,11 +294,9 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
 
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag} (${config.nodeEnv})`);
-  if (!client.application) return;
 
   try {
-    const registered = await client.application.commands.set(commands.map((command) => command.toJSON()));
-    console.log(`Registered ${registered.size} global slash commands.`);
+    await registerCommands();
   } catch (error) {
     console.error('Failed to register commands on startup:', error);
   }
@@ -356,6 +372,12 @@ client.on('interactionCreate', async (interaction) => {
       return safeReply(interaction, { content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
 
+    queue.songs = [];
+    queue.current = null;
+    clearIdleTimer(queue);
+    try {
+      await queue.player?.stopTrack();
+    } catch {}
     destroyQueue(guild.id);
     return safeReply(interaction, '⏹️ Stopped and cleared the queue.');
   }
