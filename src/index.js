@@ -380,7 +380,7 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
   });
 
   queue.player = player;
-  await queue.player.setVolume(queue.volume);
+  await queue.player.setGlobalVolume(queue.volume);
   return queue;
 }
 
@@ -636,7 +636,7 @@ client.on('interactionCreate', async (interaction) => {
 
     queue.volume = requested;
     try {
-      await queue.player?.setVolume(requested);
+      await queue.player?.setGlobalVolume(requested);
     } catch (error) {
       console.error('Failed to set volume:', error);
       return safeReply(interaction, '⚠️ Volume set internally, but Lavalink did not accept the change.');
