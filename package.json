@@ -1,5 +1,5 @@
 {
-  "name": "discord-music-bot",
+  "name": "neonix-music-bot",
   "version": "1.1.0",
   "description": "Discord music bot with slash commands for SoundCloud playback.",
   "type": "module",
@@ -8,7 +8,8 @@
     "start": "node src/index.js",
     "deploy": "node src/deploy-commands.js",
     "check": "node --check src/index.js && node --check src/commands.js && node --check src/config.js && node --check src/deploy-commands.js",
-    "test": "npm run check"
+    "test": "npm run check",
+    "verify": "npm run test"
   },
   "dependencies": {
     "discord.js": "^14.16.0",

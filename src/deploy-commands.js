@@ -3,7 +3,7 @@ import { REST, Routes } from 'discord.js';
 import { commands } from './commands.js';
 import { getConfig } from './config.js';
 
-const { discordBotToken, discordClientId } = getConfig();
+const { discordBotToken, discordClientId, discordGuildId } = getConfig();
 
 if (!discordClientId) {
   throw new Error('Missing DISCORD_CLIENT_ID. This is required to deploy slash commands.');

@@ -25,6 +25,25 @@ function parseIdList(value) {
     .filter(Boolean);
 }
 
+function parseLavalinkHost(rawHost) {
+  const trimmed = rawHost.trim();
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    const parsed = new URL(trimmed);
+    return {
+      host: parsed.hostname,
+      secure: parsed.protocol === 'https:',
+      port: parsed.port ? Number.parseInt(parsed.port, 10) : null,
+    };
+  }
+
+  return {
+    host: trimmed,
+    secure: null,
+    port: null,
+  };
+}
+
 export function getConfig() {
   const missing = requiredEnv.filter((key) => !process.env[key]?.trim());
 
@@ -32,15 +51,17 @@ export function getConfig() {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
 
+  const lavalinkTarget = parseLavalinkHost(process.env.LAVALINK_HOST);
+
   return {
     discordBotToken: process.env.DISCORD_BOT_TOKEN,
     discordClientId: process.env.DISCORD_CLIENT_ID?.trim() || null,
     discordGuildId: process.env.DISCORD_GUILD_ID?.trim() || null,
     nodeEnv: process.env.NODE_ENV?.trim() || 'development',
-    lavalinkHost: process.env.LAVALINK_HOST.trim(),
-    lavalinkPort: Number.parseInt(process.env.LAVALINK_PORT?.trim() || '2333', 10),
+    lavalinkHost: lavalinkTarget.host,
+    lavalinkPort: lavalinkTarget.port ?? Number.parseInt(process.env.LAVALINK_PORT?.trim() || '2333', 10),
     lavalinkPassword: process.env.LAVALINK_PASSWORD.trim(),
-    lavalinkSecure: process.env.LAVALINK_SECURE?.trim() === 'true',
+    lavalinkSecure: process.env.LAVALINK_SECURE?.trim() === 'true' || lavalinkTarget.secure === true,
     lavalinkName: process.env.LAVALINK_NAME?.trim() || 'main',
     premiumGuildIds: parseIdList(process.env.PREMIUM_GUILD_IDS),
     queueLimitFree: parseNumberEnv('QUEUE_LIMIT_FREE', defaults.queueLimitFree),

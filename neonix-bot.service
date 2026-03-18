@@ -1,0 +1,16 @@
+[Unit]
+Description=Neonix Discord Bot
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/projects/neonix-music-bot-prod
+EnvironmentFile=/root/.openclaw/workspace/projects/neonix-music-bot-prod/.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

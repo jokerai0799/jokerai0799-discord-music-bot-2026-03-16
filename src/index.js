@@ -376,7 +376,7 @@ async function ensurePlayer(guild, voiceChannel, textChannel) {
   return queue;
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag} (${config.nodeEnv})`);
 
   try {
@@ -652,7 +652,7 @@ client.on('interactionCreate', async (interaction) => {
 
     const embed = new EmbedBuilder()
       .setColor(queue.isPremium ? 0xfbbf24 : 0x5865f2)
-      .setTitle('Jukebox Premium Status')
+      .setTitle('Neonix Premium Status')
       .setDescription(
         queue.isPremium
           ? 'This guild is flagged as Premium in the bot configuration.'

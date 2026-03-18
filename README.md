@@ -1,4 +1,4 @@
-# Jukebox Discord Music Bot
+# Neonix Discord Music Bot
 
 Slash-command music bot focused on reliable SoundCloud playback through Lavalink. The goal is to offer strong core controls today while keeping the premium roadmap honest and grounded in what actually exists.
 
@@ -37,7 +37,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `DISCORD_CLIENT_ID` | ✅ (for slash command deploy) | Application ID |
 | `DISCORD_GUILD_ID` | optional | If set, commands deploy to a single guild for faster iteration |
 | `NODE_ENV` | optional | Defaults to `development` |
-| `LAVALINK_HOST` | ✅ | Hostname of your Lavalink node (e.g. `http://localhost`) |
+| `LAVALINK_HOST` | ✅ | Hostname of your Lavalink node (e.g. `localhost` or `127.0.0.1`) |
 | `LAVALINK_PORT` | optional | Defaults to `2333` |
 | `LAVALINK_PASSWORD` | ✅ | Lavalink auth password |
 | `LAVALINK_SECURE` | optional | Set to `true` when using HTTPS |
@@ -95,4 +95,6 @@ The current test suite runs `node --check` against the source files to catch syn
 3. Start the bot via your preferred process manager or Railway/Nixpacks deployment
 4. Use `/premium` inside a guild to confirm whether it is treated as standard or premium
 
-If the hosted Jukebox site copy ever promises more than what appears above, update either the site or this README so they stay aligned.
+If the hosted Neonix site copy ever promises more than what appears above, update either the site or this README so they stay aligned.
+
+See `HANDOFF.md` for the operational validation path, deployment-sensitive files, and rename-sensitive locations.
